@@ -1,18 +1,18 @@
-const shortId = require('shortid')
-const urlModel = require("../models/urlModel")
-
-
-//============================================================radis setup======================================================
-const redis = require("redis");
-
+const urlModel = require('../models/urlModel')
+const validURL = require('valid-url')
+const ShortUniqueId = require('short-unique-id')
+const redis = require("redis")
 const { promisify } = require("util");
 
+//-----------------------------------------------------------------------------------//
+
+//Connect to redis
 const redisClient = redis.createClient(
-    14050,
-    "redis-14050.c264.ap-south-1-1.ec2.cloud.redislabs.com",
+    13086,
+    "redis-13086.c212.ap-south-1-1.ec2.cloud.redislabs.com",
     { no_ready_check: true }
 );
-redisClient.auth("uFEGb9XOQ9tVZx363gOvS75q3Kkfb1CI", function (err) {
+redisClient.auth("yTp6IU0JMPd7gaFhO3ls2XjsEWF4hiRX", function (err) {
     if (err) throw err;
 });
 
@@ -20,84 +20,102 @@ redisClient.on("connect", async function () {
     console.log("Connected to Redis..");
 });
 
-const SET_ASYNC = promisify(redisClient.SETEX).bind(redisClient);
+
+//1. connect to the server
+//2. use the commands :
+
+//Connection setup for redis
+
+const SET_ASYNC = promisify(redisClient.SET).bind(redisClient);
 const GET_ASYNC = promisify(redisClient.GET).bind(redisClient);
-//===========================================================radis setup end======================================================^
 
 
 
-//==============================================shorten URL======================================================
-const shortenUrl = async function (req, res) {
+//------------------------------------- 1.Create Short Url API ---------------------------------------------//
+
+
+const createShortenURL = async function (req, res) {
     try {
+        const baseUrl = "http://localhost:3000/"
+
         const longUrl = req.body.longUrl
-
-        if (!longUrl)
-            return res.status(400).send({ status: false, message: "please enter longUrl" })
-
-        const regUrl = /(http|https):\/\/(\w+:{0,1}\w*@)?(\S+)(:[0-9]+)?(\/|\/([\w#!:.?+=&%@!\-/]))?/
-
-        if (!regUrl.test(longUrl))
-            return res.status(400).send({ status: false, message: "please enter valid longUrl" })
-   
-        //retriving from cache
-        let cahcedURLData = await GET_ASYNC(`${longUrl}`)
-        if (cahcedURLData) {
-            let urlObj = JSON.parse(cahcedURLData)
-            return res.status(200).send({ status: true, message: "short url is already present in cache", data: urlObj});
-        }
-        
-        const findUrl = await urlModel.findOne({ longUrl: longUrl }).select({ _id: 0, urlCode: 1, longUrl: 1, shortUrl: 1 })
-
-        if (findUrl){
-            //in case of data is expired in cache but present in db
-            await SET_ASYNC(`${longUrl}`,86400,JSON.stringify(findUrl))
-            return res.status(200).send({ status: true, message: "short url is already generated", data: findUrl })
+        if (Object.keys(req.body).length == 0) {
+            return res.status(400).send({ status: false, message: "body can not be empty" })
         }
 
-        let short = shortId.generate(longUrl)
-        let shortUrl = `http://localhost:3000/${short}`
-        let urlObj = {
-            "urlCode": short,
-            "longUrl": longUrl,
-            "shortUrl": shortUrl
+        if (longUrl == "") {
+            return res.status(400).send({ status: false, message: "Please provide link, it can not be empty" })
+        }
+        if (!longUrl) {
+            return res.status(400).send({ status: false, message: `Please provide key name as 'longUrl'` })
         }
 
-        await urlModel.create(urlObj)
-        
-        //saving in cache
-        await SET_ASYNC(`${longUrl}`,86400,JSON.stringify(urlObj))
+        if (Object.keys(req.body).length > 1) {
+            return res.status(400).send({ status: false, message: "you aren't allowed to provide another key except 'longUrl'" })
+        }
+        if (validURL.isWebUri(longUrl.toString())) {
+            let cachedUrlData = await GET_ASYNC(`${longUrl}`)
+            if (cachedUrlData) {
+                return res.status(200).send({ status: true, message: "Data coming from Cache", data: JSON.parse(cachedUrlData) })
+            }
+            else {
+                const findUrl = await urlModel.findOne({ $or: [{ longUrl: longUrl }, { shortUrl: longUrl }] }).select({ _id: 0, longUrl: 1, shortUrl: 1, urlCode: 1 })
+                if (findUrl) {
+                    await SET_ASYNC(`${longUrl}`, JSON.stringify(findUrl), "EX", 2 * 60)
+                    return res.status(200).send({ status: true, message: "data coming from DB", data: findUrl })
+                }
+                else {
 
-        return res.status(201).send({ status: true, data: urlObj})
-    } catch (err) {
-        return res.status(500).send({ status: false, message: err.message })
+                    const shortURLId = new ShortUniqueId().stamp(10)
+                    const shortenUrl = baseUrl + shortURLId
+                    const createUrl = await urlModel.create({ longUrl, shortUrl: shortenUrl, urlCode: shortURLId })
+
+                    const data = {
+                        urlCode: createUrl.urlCode,
+                        longUrl: createUrl.longUrl,
+                        shortUrl: createUrl.shortUrl
+                    }
+                    await SET_ASYNC(`${longUrl}`, JSON.stringify(data), "EX", 60)
+                    return res.status(201).send({ status: true, data: data })
+                }
+            }
+        }
+        else {
+            return res.status(400).send({ status: false, message: "invalid URL" })
+        }
+    }
+    catch (error) {
+        return res.status(500).send({ status: false, message: error.message, errorName: error.name })
     }
 }
 
-//==================================================================getLongUrl=====================================================
-const getLongUrl = async function (req, res) {
+
+
+//--------------------------------------- 2.Get Url by UrlCode API -------------------------------------------//
+
+
+const getUrlByUrlCode = async function (req, res) {
     try {
-        let urlCode = req.params.urlCode
-        if (!shortId.isValid(urlCode))
-        return res.status(400).send({ status: false, message: "urlCode is invalid" })
+        const urlCode = req.params.urlCode
 
-        //retriving from cache start
-        let cahcedURLData = await GET_ASYNC(`${urlCode}`)
-        if (cahcedURLData) {
-            let urlObj = JSON.parse(cahcedURLData)
-            return res.status(302).redirect(urlObj.longUrl);
+        let cachedUrlData = await GET_ASYNC(`${urlCode}`)
+        if (cachedUrlData) {
+            return res.status(302).redirect(cachedUrlData)
         }
-
-        const findLongUrl = await urlModel.findOne({ urlCode: urlCode }).select({ longUrl: 1, _id: 0, shortUrl:1, urlCode})
-
-        if (!findLongUrl)
-            return res.status(404).send({ status: false, message: "url not found for the given url code" })
-
-        await SET_ASYNC(`${urlCode}`,86400,JSON.stringify(findLongUrl))
-
-        return res.status(302).redirect(findLongUrl.longUrl);
-    } catch (err) {
-        return res.status(500).send({ status: false, message: err.message })
+        else {
+            const findUrlCode = await urlModel.findOne({ urlCode }).select({ longUrl: 1, _id: 0 })
+            if (findUrlCode) {
+                await SET_ASYNC(`${urlCode}`, findUrlCode.longUrl, "EX", 2 * 60)
+                return res.status(302).redirect(findUrlCode.longUrl)
+            } else {
+                return res.status(404).send({ status: false, message: "no url found" })
+            }
+        }
+    } catch (error) {
+        return res.status(500).send({ status: false, message: error.message, errorName: error.name })
     }
 }
 
-module.exports = { shortenUrl, getLongUrl }
+//-----------------------------------------------------------------------------------//
+
+module.exports = { createShortenURL, getUrlByUrlCode }
